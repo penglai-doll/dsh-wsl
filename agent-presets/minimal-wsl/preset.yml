@@ -1,0 +1,3 @@
+name: 极简模式 (WSL)
+description: 极简模式的 Windows/WSL 变体：bash 在 WSL 中执行（非持久与持久 PTY 双通道），文件工具保持 Windows 路径，其余与原极简模式一致。
+order: 4

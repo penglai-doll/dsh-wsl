@@ -1,0 +1,135 @@
+# The `minimal-wsl` agent preset: the shipped `minimal` preset's Windows/WSL
+# variant. Same fixed persona, two-tool surface and str_replace_editor, but
+# bash commands execute inside WSL instead of the local PTY shell (which
+# `subprocess-local` cannot spawn on win32 at all).
+#
+# Two execution paths are provided, both Windows-only (the groups disable on
+# non-win32; Linux/macOS hosts should use the shipped `minimal` preset):
+#   wsl-shell        — `bash` tool over wsl.exe, a fresh shell per call.
+#   persistent-shell — persistent PTY bash via the `dsh-wsl` terminal
+#                      backend (node-pty ConPTY -> wsl.exe -> bash), the
+#                      WSL equivalent of the original persistent shell.
+#
+# Sandbox: commands inside the WSL VM cannot be confined by the Windows
+# restricted-token sandbox, so both paths gate on the danger-full-access
+# policy — switch the session to full access, or let the model retry a single
+# command with sandbox_permissions: "danger-full-access" + justification.
+#
+# The persona is the complete system prompt, so global identity, Web
+# orientation, tool guidance, and later assembly listeners cannot add prompt
+# text. Runtime context snapshots are suppressed, and the model composes only
+# `bash` and `str_replace_editor`. Context compaction is absent.
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |-
+      You are a helpful software engineer assistant.
+
+      You are running on Windows, but every bash command executes inside WSL
+      (Windows Subsystem for Linux, Ubuntu) on the same machine. Rules:
+
+      * Windows paths and WSL paths refer to the same files: D:\dir\file is
+        /mnt/d/dir/file inside WSL (lowercase drive letter under /mnt). Use
+        Windows-style paths with file tools (str_replace_editor) and /mnt/...
+        paths inside bash commands.
+      * Each bash call is a fresh shell: no state (cwd, variables, functions)
+        persists between calls. Combine steps into one command or use absolute
+        /mnt paths instead of relying on `cd`.
+      * Files under the WSL home directory (/home/...) live in the WSL
+        filesystem and are not reachable by file tools; keep project work
+        under /mnt/<drive>/....
+      * You have no internet access via the bash tool, but the WSL distro has
+        apt and pip available for Linux-only tooling.
+      * Commands run unsandboxed inside the WSL VM. If a command fails with a
+        sandbox gate message, retry the exact command once with
+        sandbox_permissions: "danger-full-access" plus a justification, or ask
+        the user to switch the session to full access (完全访问) mode.
+    complete: true
+    includeRuntimeContext: false
+
+# The shell provider is an agent-owned service, so it lives in an entry-local
+# realm like the shipped preset's PTY registry did. The executor consumes the
+# host subprocess service, while the tool registers into this agent's scoped
+# catalog. The local module carries no package imports because preset-local
+# files resolve against the preset directory, not DSH's node_modules.
+- id: wsl-shell
+  name: cordis:group
+  group: true
+  disabled: !!js process.platform !== 'win32'
+  isolate:
+    shell: true
+  config:
+    - id: wsl-executor
+      name: ./wsl-executor.mjs
+      config:
+        # distro 留空则使用 WSL 默认发行版；显式指定如 'Ubuntu' / 'archlinux'
+        distro: Ubuntu
+        timeoutMs: 120000
+        maxTimeoutMs: 600000
+        maxOutputBytes: 64000
+        maxSpillBytes: 67108864
+        graceMs: 3000
+
+    - id: tool-bash
+      name: '@deepseek-ai/dsh-tool-bash'
+      config:
+        enableRunInBackground: false
+
+# Persistent PTY bash: the WSL equivalent of the shipped preset's persistent
+# shell. The `dsh-wsl` row registers its terminal backend into this group's
+# isolated `terminals` registry; the tool opens sessions through it.
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  disabled: !!js process.platform !== 'win32'
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: wsl-backend
+      name: 'dsh-wsl'
+      config:
+        distro: Ubuntu
+        # Mounted inside the preset realm: only the terminal backend role.
+        terminalBackend: true
+        registerWslTool: false
+        installPreset: false
+        warmup: false
+        settingsApi: false
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      config:
+        backendType: shell
+        timeoutMs: 300000
+        description: |-
+          Run commands in a persistent bash shell inside WSL (Windows Subsystem for Linux)
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * State is persistent across command calls and discussions with the user: cwd and shell variables survive.
+          * Windows paths and WSL paths refer to the same files: D:\dir\file is /mnt/d/dir/file inside WSL.
+            File tools use Windows paths; bash commands use /mnt/... paths.
+          * Files under the WSL home (/home/...) are not reachable by file tools; keep project work under /mnt/<drive>/....
+          * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+
+# The bare local filesystem shadows the host's sandboxed provider only for this
+# preset. The editor shares that realm and requires absolute paths.
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    - id: fs-local
+      name: '@deepseek-ai/dsh-fs-local'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000
