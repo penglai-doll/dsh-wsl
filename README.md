@@ -3,6 +3,10 @@
 [![GitHub topics: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-7c3aed)](https://github.com/topics/dsh-plugin)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
+> 中英双语 Bilingual：中文在前，English below.
+
+## 中文
+
 DeepSeek Harness 插件：在 Windows 上通过 WSL（Windows Subsystem for Linux）执行命令。
 
 解决两个问题：
@@ -123,3 +127,124 @@ New-Item -ItemType Junction -Path 'node_modules\node-pty' -Target "$env:DSH_HOME
 ## License
 
 MIT
+
+---
+
+## English
+
+DeepSeek Harness plugin: execute commands on Windows through WSL (Windows Subsystem for Linux).
+
+It solves two problems:
+
+1. **DSH's minimal preset is unusable on Windows** — the bundled `minimal-wsl` preset ("极简模式 (WSL)") maps the minimal preset's bash onto WSL, with two implementations: non-persistent (a fresh shell per call) and persistent PTY (state kept, interactive programs, Ctrl-C);
+2. **A DSH install on Windows wants to use the WSL environment directly for project work** — a general-purpose `wsl` model tool runs a single WSL command from a standard/cordis session on the Windows side.
+
+## Why the minimal preset fails on Windows
+
+| Failure point | Root cause |
+|---|---|
+| Persistent PTY | `@deepseek-ai/dsh-subprocess-local` refuses terminal process inspection on win32 (`terminal inspection is unsupported on platform win32`) |
+| Non-persistent bash | `@deepseek-ai/dsh-bash-local` hardcodes `bash -c`, and Windows has no `bash` on PATH |
+
+The filesystem is not the problem (`dsh-fs-local` works fine on Windows) — only the shell execution layer is. This plugin moves the whole execution layer into WSL while keeping the Windows-side file tools.
+
+## Architecture
+
+```
+dsh-wsl/
+├── lib/
+│   ├── index.js       # Host half: preset installer + general wsl tool + /wsl-manager API
+│   ├── backend.js     # WSL TerminalBackend for the persistent PTY (node-pty ConPTY -> wsl.exe -> Linux PTY)
+│   ├── wsl.js         # distro discovery, WSLENV merging, warm-up (pure, testable)
+│   ├── path.js        # Windows ⇄ /mnt path translation (pure)
+│   └── client.js      # Web Plugins settings "WSL" tab (distro list / warm-up / diagnostics)
+├── agent-presets/
+│   └── minimal-wsl/   # bundled preset: persona (path rules) + wsl-shell group + persistent-shell group + filesystem group
+│       └── wsl-executor.mjs   # zero-dependency executor: wsl.exe [-d distro] [--cd /mnt/...] -- bash -c <cmd>
+└── test/              # unit tests (pure logic) + two live smoke suites (need local WSL)
+```
+
+### Execution paths
+
+- **Non-persistent bash**: `wsl-executor.mjs` (a preset-local file, Node built-ins only) provides `ctx.provide('shell')` inside an entry-local realm, with `dsh-tool-bash` registered on top. Each command is one `wsl.exe` call.
+- **Persistent PTY**: `WslTerminalBackend` registers into the preset group's `terminals` registry (type `shell`); `dsh-tool-bash-persistent` opens sessions through it. node-pty allocates a ConPTY on the Windows side, wsl.exe gives the Linux bash a real PTY — interactive programs, Ctrl-C and job control work natively (the same mechanism Windows Terminal uses). Command completion is detected via the prompt marker (OSC 133;D + controlled PS1 `dsh> `) with silent-inference and timeout fallbacks; the Linux bash pid is reported back through a private OSC 777 sequence, and `signal()` resolves the foreground process group through a wsl.exe side-channel reading `/proc/<pid>/stat`.
+
+## Install
+
+Install the plugin into DSH's profile workspace (both preset rows and profile rows resolve from there):
+
+1. Add `dsh-wsl` to the dependencies of `C:\Users\<you>\.dsh\profiles\web\package.json`:
+   ```json
+   "dependencies": { "dsh-wsl": "file:D:/Project/DSH-Plugins/dsh-wsl" }
+   ```
+2. Run `pnpm install` in that directory;
+3. Append the plugin row to `profiles\web\cordis.patch.yml`:
+   ```yaml
+   - insert:
+       - id: dsh-wsl
+         name: 'dsh-wsl'
+   ```
+4. Restart DSH web. The host half auto-installs the `minimal-wsl` preset into `${DSH_HOME}/.agent-presets/minimal-wsl/` (skipped if it already exists; `force: true` to overwrite).
+
+> After editing the plugin code, pnpm's file: dependency does not re-copy automatically: delete `profiles\web\node_modules\dsh-wsl` and re-run `pnpm install` (or edit the repo the `file:` path points at and then delete that directory).
+
+**Prerequisites**: Windows 10/11 + WSL2 + at least one distro (`wsl --install`). The persistent PTY depends on `node-pty` (already bundled with DSH in the profile workspace).
+
+## Usage
+
+1. **Distro selection**: in Web Plugins settings → plugin configuration → the **WSL card** (horizontal bar), pick a local distro from the dropdown (empty = WSL default distro). The choice takes effect immediately and is persisted to `settings.yaml` (`wsl.distro`); the executor, persistent PTY backend and wsl tool read it on every call — no restart needed.
+2. **极简模式 (WSL)**: select this preset when creating a new session. The two-tool surface (bash + str_replace_editor) matches the original minimal preset, but commands execute in WSL.
+3. **General wsl tool**: the host half registers a `wsl` tool (command/description/timeoutMs/workdir/distro). Note: DSH model tools are registered by preset rows, so a host-level registration may not be visible to preset-scoped sessions — to use it in a standard/cordis session, add the tool row to that preset's user composition (a standard-preset variant is planned for a later version).
+4. **Path rules** (written into the preset persona and tool descriptions): file tools use `D:\dir\file`, bash commands use `/mnt/d/dir/file`, the same files.
+5. **Sandbox**: bash/wsl tools only run after the session is switched to **full access**. In confined modes they return clear guidance (processes inside the WSL VM are not bound by the Windows restricted token, and reach all Windows files through /mnt/* — a confined mode would only appear to confine). Sandbox mode cannot be changed while a persistent PTY session is open (same as the official backend).
+
+## Configuration
+
+Host half (`cordis.patch.yml` row config):
+
+| Field | Default | Description |
+|---|---|---|
+| `distro` | empty = default distro | fallback distro; the settings-page choice (`wsl.distro`) wins |
+| `installPreset` | `true` | auto-install the minimal-wsl preset |
+| `force` | `false` | overwrite the preset when it already exists |
+| `registerWslTool` | `true` | register the general wsl tool |
+| `warmup` | `true` | warm the distro after plugin load (skip the first cold boot) |
+| `settingsApi` | `true` | serve the /wsl-manager/* routes (status / distro save / warm-up) |
+| `terminalBackend` | `false` (explicit opt-in) | register the persistent PTY backend in the preset realm; the minimal-wsl preset's backend row sets `true` |
+| `timeoutMs` / `maxTimeoutMs` / `maxOutputBytes` / `graceMs` | 120000 / 600000 / 64000 / 3000 | execution budgets for the wsl tool |
+
+`wsl-executor.mjs` (the preset's `agent.cordis.yml` config): `distro` (fallback), `timeoutMs`, `maxTimeoutMs`, `maxOutputBytes`, `maxSpillBytes`, `graceMs`.
+
+> Implementation note: the host half declares `inject: ['webServer', 'tools', 'subprocess']`. A row without inject activates before those services exist and every `ctx.get()` comes back empty — the symptom is a 404/fallback status API and a missing tool (the 0.1.0 first-release online symptom).
+
+## Sandbox & trust model (read this)
+
+- WSL2 is a virtual machine: the Windows restricted-token/ACL sandbox only confines the `wsl.exe` launcher stub — **it has no effect on Linux processes inside the VM**.
+- The Linux side can read and write every Windows file through `/mnt/*` (drvfs/9P).
+- Therefore this plugin **refuses to run in non-full-access modes** rather than pretend to be confined. Switch the session sandbox or let the model escalate once.
+
+## Known limitations
+
+- **stdin forwarding unsupported**: wsl.exe's stdin relay cannot feed bash builtins (bash caches an EOF at startup, and data that arrives later is only visible to raw reads that bypass bash's buffer — verified empirically). The executor returns a clear error for `stdin` requests, pointing to heredoc instead.
+- Each non-persistent call has ~100ms warm overhead; a distro cold boot is ~5–7s (the plugin warms it once automatically).
+- Heavy builds (lots of small-file I/O) under `/mnt/*` are slower than on the WSL-native filesystem; projects can live in the WSL home (then file tools can't see them — `\\wsl.localhost` UNC project dirs are planned for v2).
+- drvfs permission semantics: files are always 777, chmod is a no-op (git/scripts still work under /mnt).
+- The persistent PTY does not support runtime resize (the `TerminalBackendSession` contract itself has no resize method).
+- Backslashes in command-line args get swallowed by wsl.exe, so all path translation is done in JS, never via `wslpath`.
+
+## Development & testing
+
+```bash
+npm test                      # unit tests (pure logic, no WSL needed)
+node test/smoke-live.mjs      # non-persistent executor live smoke (needs local WSL)
+node test/backend-smoke-live.mjs  # persistent PTY live smoke (needs local WSL + node-pty)
+node test/tool-smoke-live.mjs     # general wsl tool live smoke (needs local WSL)
+```
+
+Running tests locally requires peerDependencies: the repo's `node_modules` is a junction to the profile workspace's `node_modules` (git-ignored); rebuild as needed:
+
+```powershell
+New-Item -ItemType Directory -Path node_modules -Force | Out-Null
+New-Item -ItemType Junction -Path 'node_modules\@deepseek-ai' -Target "$env:DSH_HOME\profiles\node_modules\@deepseek-ai" -Force | Out-Null
+New-Item -ItemType Junction -Path 'node_modules\node-pty' -Target "$env:DSH_HOME\profiles\node_modules\node-pty" -Force | Out-Null
+```
