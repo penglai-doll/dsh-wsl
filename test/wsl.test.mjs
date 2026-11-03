@@ -68,7 +68,13 @@ test('warmupDistro: best-effort and injectable', () => {
   }
   assert.equal(warmupDistro('Ubuntu', exec), true)
   assert.equal(spawned.file, 'wsl.exe')
-  assert.deepEqual(spawned.args, ['wsl.exe', '-d', 'Ubuntu', '--', 'true'])
+  assert.deepEqual(spawned.args, ['-d', 'Ubuntu', '--', 'true'])
+  // The warm-up must stay invisible: no visible console window on Windows.
+  assert.equal(spawned.options.windowsHide, true)
+  assert.notEqual(spawned.options.detached, true)
+  // Without a distro the call must not invent a -d argument.
+  assert.equal(warmupDistro(undefined, exec), true)
+  assert.deepEqual(spawned.args, ['--', 'true'])
   // throwing exec degrades to false, never throws
   assert.equal(warmupDistro('Ubuntu', () => { throw new Error('boom') }), false)
 })
